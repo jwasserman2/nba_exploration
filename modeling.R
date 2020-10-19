@@ -5,6 +5,7 @@ library(rlang)
 library(glmnet)
 library(ggplot2)
 
+read <- read.csv("~/Downloads/summary_112.csv")
 
 # Get scraped data
 stats <- read.csv("~/Desktop/player_stats.csv")
@@ -17,6 +18,30 @@ orange <- "#FF8C00"
 green <- "#228B22"
 purple <- "#4B0082"
 red <- "#B22222"
+
+# Utils
+make_factor_dummy_matrix <- function(df, factor_col) {
+  # Pull the factor column
+  new_df <- df %>% dplyr::select(!!sym(factor_col))
+
+  # Make 0/1 columns for each individual level of the factor column
+  for (lvl in forcats::lvls_union(new_df[factor_col])) {
+    new_df <- new_df %>%
+      dplyr::mutate(
+        !!sym(glue("{factor_col}_is_{lvl}")) := as.factor(ifelse(
+          !!sym(factor_col) == lvl,
+          1,
+          0
+        ))
+      )
+  }
+
+  new_df <- new_df %>% dplyr::select(-!!sym(factor_col))
+  out <- cbind(df, new_df) %>%
+    dplyr::select(-!!sym(factor_col))
+
+  return(out)
+}
 
 # Make lagged variables
 new_vars <- stats %>%
@@ -39,6 +64,23 @@ n_lagged_obs <- new_vars %>%
     TRUE ~ 1
   )) %>%
   dplyr::summarize_all(sum)
+
+# Make season approximation by comparing age to min age (since data starts in
+# 1980 and players weren't necessarily rookies then we set this to NULL for
+# anyone over the age of 23 before 1993)
+min_ages <- new_vars %>%
+  dplyr::group_by(player) %>%
+  dplyr::summarize(min_age = min(age)) %>%
+  dplyr::ungroup()
+
+new_vars <- new_vars %>%
+  dplyr::left_join(min_ages, by = "player") %>%
+  dplyr::mutate(
+    season = dplyr::case_when(
+      min_age <= 23 | year > 1993 ~ age - min_age + 1,
+      TRUE ~ NA_real_
+    )
+  )
 
 # Correlation Viz
 make_cor_scatter <- function(df, stat) {
@@ -82,6 +124,27 @@ make_cor_scatter(new_vars, "fg3_pct")
 make_cor_scatter(new_vars, "mp_per_g")
 make_cor_scatter(new_vars, "ft_pct")
 
+draft_age_data <- new_vars %>%
+  dplyr::group_by(season, min_age) %>%
+  dplyr::summarize(mean_pts = median(pts_per_g),
+                   n = n(),
+                   sd = sd(pts_per_g)) %>%
+  dplyr::ungroup()
+
+draft_age_data %>%
+  dplyr::filter(!is.na(season), season < 16, min_age < 25) %>%
+  ggplot() +
+  geom_line(aes(x = season, y = mean_pts, group = min_age,
+                color = as.factor(min_age)), size = 2) +
+  # geom_point(aes(x = season, y = mean_pts,
+  #                color = factor(min_age, levels = seq(18, 25, 1)),
+  #            size = n)) +
+  scale_x_continuous(breaks = 1:20) +
+  scale_color_brewer(palette = "Blues", direction = -1) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank())
+
 # Ridge Model
 run_ridge_regression <- function(df, stat, nfolds, age_as_factor = TRUE) {
   # Create age * lag interaction variables, as well as unique ID for each row
@@ -90,13 +153,13 @@ run_ridge_regression <- function(df, stat, nfolds, age_as_factor = TRUE) {
 
   if (age_as_factor) {
     age_factors <- df %>%
-      dplyr::select(tidyselect::matches("^is_")) %>%
+      dplyr::select(tidyselect::matches("_is_")) %>%
       colnames()
 
     training_data <- df %>%
       dplyr::filter(g > 10) %>%
       dplyr::mutate_at(
-        vars(tidyselect::matches(glue("{stat}."))),
+        vars(tidyselect::starts_with(glue("{stat}_"))),
         .funs = purrr::map(
           age_factors,
           ~ as.formula(glue("~ dplyr::case_when(
@@ -113,7 +176,7 @@ run_ridge_regression <- function(df, stat, nfolds, age_as_factor = TRUE) {
     training_data <- df %>%
       dplyr::filter(g > 10) %>%
       dplyr::mutate_at(
-        vars(tidyselect::matches(glue("{stat}."))),
+        vars(tidyselect::starts_with(glue("{stat}."))),
         .funs = list("age" = ~ age * .)
         ) %>%
       dplyr::filter_all(all_vars(!is.na(.))) %>%
@@ -197,6 +260,7 @@ run_ridge_regression <- function(df, stat, nfolds, age_as_factor = TRUE) {
   ))
 }
 
+# Original Regression
 pts_ridge <- run_ridge_regression(new_vars, "pts_per_g", 5, FALSE)
 preds <- pts_ridge$preds
 mse <- mean((preds$pred - preds$pts_per_g)^2)
@@ -205,6 +269,7 @@ corr <- cor(preds$pred, preds$pts_per_g)
 ggplot(preds) +
   geom_boxplot(aes(x = age, y = (pred - pts_per_g)^2, group = age))
 
+# Age as factor regression
 factor_age <- new_vars %>%
   dplyr::mutate_at("age", ~ as.factor(.x)) %>%
   make_factor_dummy_matrix("age")
@@ -212,48 +277,75 @@ pts_ridge_factor_age <- run_ridge_regression(factor_age, "pts_per_g", 5)
 factor_age_preds <- pts_ridge_factor_age$preds
 factor_age_mse <- mean((factor_age_preds$pred - factor_age_preds$pts_per_g)^2)
 factor_age_mse_by_age <- factor_age_preds %>%
-  dplyr::group_by(is_24) %>%
+  dplyr::group_by(age_is_30) %>%
   dplyr::summarize(mse = mean((pred - pts_per_g) ^2),
                    avg = mean(pts_per_g)) %>%
   as.data.frame()
 
-# Predicted values viz
-actual_vs_pred <- preds %>%
-  dplyr::select(row_num, pred, pts_per_g) %>%
-  tidyr::pivot_longer(c("pred", "pts_per_g")) %>%
-  ggplot() +
-  geom_density(aes(x = value, fill = name), alpha = .6)
-
-errors <- preds %>%
-  dplyr::transmute(error = pred - pts_per_g) %>%
-  ggplot() +
-  geom_density(aes(x = error), fill = green, color = green, alpha = .7)
-
-mse_by_age <- preds %>%
+# Only one-lag regression
+one_lag_only <- run_ridge_regression(
+  new_vars %>%
+    dplyr::select(-c("pts_per_g_minus_2",
+                     "pts_per_g_minus_3")),
+  "pts_per_g",
+  5,
+  TRUE)
+one_lag_only_preds <- one_lag_only$preds
+one_lag_only_mse <- mean((one_lag_only_preds$pred - one_lag_only_preds$pts_per_g)^2)
+one_lag_only_mse_by_age <- one_lag_only_preds %>%
   dplyr::group_by(age) %>%
   dplyr::summarize(mse = mean((pred - pts_per_g) ^2),
                    avg = mean(pts_per_g)) %>%
   as.data.frame()
 
-make_factor_dummy_matrix <- function(df, factor_col) {
-  # Pull the factor column
-  new_df <- df %>% dplyr::select(!!sym(factor_col))
+# Draft age as factor regression
+draft_age_included <- factor_age %>%
+  dplyr::mutate_at("min_age", ~ as.factor(.x)) %>%
+  make_factor_dummy_matrix("min_age") %>%
+  dplyr::select(-tidyselect::matches("minus_4"))
+draft_age_reg <- run_ridge_regression(draft_age_included, "fg_pct", 5, TRUE)
+draft_age_preds <- draft_age_reg$preds
+draft_age_reg_mse <- mean((draft_age_preds$pred - draft_age_preds$fg_pct)^2)
 
-  # Make 0/1 columns for each individual level of the factor column
-  for (lvl in forcats::lvls_union(new_df[factor_col])) {
-    new_df <- new_df %>%
-      dplyr::mutate(
-        !!sym(glue("is_{lvl}")) := as.factor(ifelse(
-          !!sym(factor_col) == lvl,
-          1,
-          0
-        ))
-      )
-  }
+# Spline Regression
+reg <- new_vars %>%
+  dplyr::mutate_at(c("season", "age", "min_age"), ~ as.factor(.x)) %>%
+  mgcv::gam(fg_pct ~ age + season +
+              fg_pct_minus_1 + fg_pct_minus_2 + fg_pct_minus_3 +
+              fg_pct_minus_4 +
+              s(fg_pct_minus_1, age, bs = "re") +
+              s(fg_pct_minus_1, season, bs = "re") +
+              s(fg_pct_minus_2, age, bs = "re") +
+              s(fg_pct_minus_2, season, bs = "re"),
+            data = .)
+base_reg <- glm(fg_pct ~ age + season + fg_pct_minus_1 + fg_pct_minus_2 +
+                  fg_pct_minus_3 + fg_pct_minus_4 + min_age,
+                data = new_vars %>%
+                  dplyr::mutate_at(c("season", "age", "min_age"),
+                                   ~ as.factor(.x)))
 
-  new_df <- new_df %>% dplyr::select(-!!sym(factor_col))
-  out <- cbind(df, new_df) %>%
-    dplyr::select(-!!sym(factor_col))
+# Stan
 
-  return(out)
-}
+# Predicted values viz
+actual_vs_pred <- draft_age_preds %>%
+  dplyr::select(row_num, pred, fg_pct) %>%
+  tidyr::pivot_longer(c("pred", "fg_pct")) %>%
+  ggplot() +
+  geom_density(aes(x = value, fill = name), alpha = .6)
+
+errors <- draft_age_preds %>%
+  dplyr::transmute(error = pred - fg_pct) %>%
+  ggplot() +
+  geom_density(aes(x = error), fill = green, color = green, alpha = .7)
+
+mse_by_age <- stats %>%
+  dplyr::inner_join(
+    draft_age_preds %>%
+      dplyr::select(player, year, pred),
+    by = c("player", "year")) %>%
+  dplyr::group_by(age) %>%
+  dplyr::summarize(mse = mean((pred - fg_pct) ^2),
+                   avg = mean(fg_pct)) %>%
+  as.data.frame()
+
+
