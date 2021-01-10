@@ -14,8 +14,9 @@ logger.setLevel('INFO')
 base_ncaa_url = 'https://www.sports-reference.com'
 
 # Constant regex expressions
-PLYR_NAME_REGEX = '(?<=csk=")[\'A-Za-z0-9\\s\\-,.\\\\_()é]+(?=")'
+PLYR_NAME_REGEX = '(?<=csk=")[\\\'A-Za-z0-9\\s\\-,.\\\\_()é]+(?=")'
 STAT_REGEX = '(?<=data-stat=")[A-Za-z0-9_\\-]+(?=")'
+ID_REGEX = '(?<=data-append-csv=")[A-Za-z0-9\\-_]+(?=")'
 
 
 # Functions
@@ -45,6 +46,11 @@ def make_stats_df(hidden_tables, type: str):
             for x in y
         } for y in soup
     }
+    for x in soup:
+        pid = re.findall(ID_REGEX, str(x))[0]
+        name = re.findall(PLYR_NAME_REGEX, str(x))[1]
+        s_dict[name].update({'pid': pid})
+
     df = pd.DataFrame(s_dict).transpose().reset_index().drop(
         columns=['ranker', 'player'])
 
@@ -59,6 +65,7 @@ schools = school_soup.find('tbody') \
     .find_all('td', attrs={'data-stat': 'school_name'})
 regex = '(?<=href=")[A-Za-z/\-]+(?=")'
 schools_links = [re.findall(regex, str(x))[0] for x in schools]
+logging.info('Finished pulling schools')
 
 # Get seasons for each school
 logging.info('Grabbing seasons for each school from NCAA Reference...')
@@ -74,11 +81,12 @@ for num, suffix in enumerate(schools_links):
     if num % 50 == 0:
         logging.info('Grabbed seasons for school {} out of {}'.format(
             num, len(schools_links) - 1))
+logging.info('Finished pulling seasons')
 
 # Make individual-level NCAA stats df
 all_ncaa = pd.DataFrame()
 all_school_stats = pd.DataFrame()
-for num, suffix in enumerate(season_links):
+for num, suffix in enumerate(season_links[4434:len(season_links)]):
     year = suffix.split('/')[len(suffix.split('/')) - 1].replace(
         '.html', '')
     if int(year) < 1995:
@@ -173,5 +181,6 @@ for num, suffix in enumerate(season_links):
         logging.info('Grabbed stats for team/season {}, number {} out of {}'.format(
             suffix, num, len(season_links)))
 
+logging.info('Finished pulling player stats')
 all_ncaa.to_csv('~/Desktop/all_ncaa_stats.csv', index=False)
 all_school_stats.to_csv('~/Desktop/all_school_stats.csv', index=False)
