@@ -86,7 +86,7 @@ logging.info('Finished pulling seasons')
 # Make individual-level NCAA stats df
 all_ncaa = pd.DataFrame()
 all_school_stats = pd.DataFrame()
-for num, suffix in enumerate(season_links[4434:len(season_links)]):
+for num, suffix in enumerate(season_links[(15798 + 4434):len(season_links)]):
     year = suffix.split('/')[len(suffix.split('/')) - 1].replace(
         '.html', '')
     if int(year) < 1995:
