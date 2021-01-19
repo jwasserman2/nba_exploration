@@ -1,6 +1,7 @@
 library(dplyr)
 library(stringr)
 library(magrittr)
+library(rlang)
 library(ggplot2)
 
 # Load data
@@ -195,8 +196,10 @@ adjusted <- adjusted %>%
     ncaa_team %>%
       dplyr::select(season, school, sos)
   ) %>%
+  dplyr::mutate(dws_per_40 = dws / mp * 40) %>%
   dplyr::mutate_at(
-    paste0(counting_stats[counting_stats != "tov"], "_per_100"),
+    c(paste0(counting_stats[counting_stats != "tov"], "_per_100"),
+      "dws_per_40", "ws_per_40"),
     list("sos_weighted" = ~ .x * (1 / exp(sos * sos_coefs[['pts']])))
   ) %>%
   dplyr::mutate_at(
@@ -208,5 +211,6 @@ adjusted <- adjusted %>%
     "_sos_weighted")) %>%
   dplyr::mutate(
     tov_per_100_sos_weighted = tov_per_100 * exp(sos * sos_coefs[['pts']]),
-    tov_pct_sos_weighted = tov_pct * exp(sos * sos_coefs[['fg_pct']])
+    tov_pct_sos_weighted = tov_pct * exp(sos * sos_coefs[['fg_pct']]),
+    mp_per_g = mp / g
   )
