@@ -36,7 +36,7 @@ adjusted <- ncaa_player %>%
   )
 
 # Change RSCI and Class to factor
-adjusted <- adjusted %>%
+adjusted %<>%
   dplyr::mutate(
     rsci = factor(
       dplyr::case_when(
@@ -48,13 +48,11 @@ adjusted <- adjusted %>%
         rsci >= 2 ~ "2-5",
         rsci == 1 ~ "1"
       ),
-      levels = c("1", "2-5", "6-10", "11-25", "26-50", "50-100", "unranked"),
-      ordered = TRUE),
+      levels = c("1", "2-5", "6-10", "11-25", "26-50", "50-100", "unranked")),
     class = factor(
       class,
       levels = c("FR", "Fr", "SO", "JR", "Jr", "SR", "Sr", "sr"),
-      labels = c("FR", "FR", "SO", "JR", "JR", "SR", "SR", "SR"),
-      ordered = TRUE
+      labels = c("FR", "FR", "SO", "JR", "JR", "SR", "SR", "SR")
     )
   )
 
@@ -65,7 +63,7 @@ counting_stats <- c(
 )
 
 # Account for pace: calculate total stats as per 100 possessions
-adjusted <- adjusted %>%
+adjusted %<>%
   dplyr::mutate_at(counting_stats,
                    list("per_100" = ~ .x / (pace / 40 * mp) * 100,
                         "per_g" = ~ .x / g))
@@ -191,7 +189,7 @@ sos_coefs <- purrr::map_dbl(
   setNames(c("pts", "fg_pct"))
 
 # Weight stats by 1 / exp(SOS * coef) (exp(SOS * coef) for turnover stats)
-adjusted <- adjusted %>%
+adjusted %<>%
   dplyr::left_join(
     ncaa_team %>%
       dplyr::select(season, school, sos)
@@ -214,3 +212,86 @@ adjusted <- adjusted %>%
     tov_pct_sos_weighted = tov_pct * exp(sos * sos_coefs[['fg_pct']]),
     mp_per_g = mp / g
   )
+
+
+# Scraper set 0's for NA's for a few columns, will impute here
+adjusted %<>%
+  dplyr::mutate_at(c("drb", "orb"),
+                   ~ ifelse(season <= 2000 & .x == 0, NA_real_, .x)) %>%
+  dplyr::mutate_at(c("drb_pct", "orb_pct"),
+                   ~ ifelse(season <= 2009 & .x == 0, NA_real_, .x))
+
+reb_impute_cols <- c("pos", "height", "fg2a", "fg2a_per_100", "fg2_pct",
+                     "fta_per_fga_pct", "trb_per_100", "rsci", "trb")
+
+glm_impute_col <- function(player_df, impute_dv, impute_covs, impute_covs_to_dummify) {
+  message(str_glue("Imputing {impute_dv}..."))
+  # GLM model used for imputing
+  form <- as.character(str_glue("{impute_dv} ~ ."))
+  X_train <- player_df %>%
+    dplyr::select(!!!syms(c(impute_covs, impute_dv))) %>%
+    dplyr::filter_all(all_vars(!is.na(.))) %>%
+    dplyr::filter_all(all_vars(. != Inf)) %>%
+    dplyr::mutate_at(impute_covs_to_dummify, as.factor)
+
+  stopifnot(nrow(X_train) > 2000)
+
+  y <- player_df %>%
+    dplyr::select(!!!syms(c(impute_covs, impute_dv))) %>%
+    dplyr::filter_all(all_vars(!is.na(.))) %>%
+    dplyr::filter_all(all_vars(. != Inf)) %>%
+    dplyr::pull(!!sym(impute_dv))
+
+  stopifnot(length(y) == nrow(X_train))
+
+  message(str_glue("Training model with {dim(X_train)[1]} training records"))
+  mod <- glmnet::cv.glmnet(model.matrix(as.formula(form), X_train), as.matrix(y))
+
+  # Join imputed values and add to full df
+  X_pred <- player_df %>%
+    dplyr::filter(is.na(!!sym(impute_dv))) %>%
+    dplyr::select(!!!syms(impute_covs)) %>%
+    dplyr::filter_all(all_vars(!is.na(.))) %>%
+    dplyr::filter_all(all_vars(. != Inf)) %>%
+    dplyr::mutate_at(impute_covs_to_dummify, as.factor)
+
+  stopifnot(nrow(X_pred) > 0)
+  message(str_glue("Generating {dim(X_pred)[1]} imputed values for {impute_dv}"))
+  preds <- predict(mod, model.matrix(~ ., X_pred))
+
+  # Return df that has impute values and original values and columns indicating
+  # the imputed values
+  joined_preds <- player_df %>%
+    dplyr::filter(is.na(!!sym(impute_dv))) %>%
+    dplyr::select(-!!sym(impute_dv)) %>%
+    dplyr::filter_at(dplyr::setdiff(impute_covs, impute_dv),
+                     ~ !is.na(.x)) %>%
+    dplyr::filter_at(dplyr::setdiff(impute_covs, impute_dv),
+                     ~ .x != Inf) %>%
+    dplyr::bind_cols(!!impute_dv := as.vector(preds)) %>%
+    dplyr::mutate(!!str_glue("{impute_dv}_imputed") := 1)
+
+  out_df <- player_df %>%
+    dplyr::filter(!(pid %in% joined_preds$pid)) %>%
+    dplyr::mutate(!!str_glue("{impute_dv}_imputed") := 0) %>%
+    dplyr::bind_rows(joined_preds)
+  message(nrow(out_df))
+
+  # Bind rows that didn't have enough data for imputation--will remove later
+  missing_imputations <- out_df %>%
+    dplyr::filter(is.na(!!sym(impute_dv)))
+  message(str_glue("Failed to impute {nrow(missing_imputations)} records due to \\
+                   missing data"))
+
+  stopifnot(nrow(out_df) == nrow(player_df))
+
+  return(out_df)
+}
+
+adjusted <- glm_impute_col(adjusted, "orb", reb_impute_cols, c("rsci"))
+
+adjusted %>%
+  dplyr::filter(is.na(orb)) %>%
+  dplyr::select(c(reb_impute_cols, "orb")) %>%
+  dplyr::filter_at(reb_impute_cols, all_vars(!is.na(.))) %>%
+  dplyr::filter_at(reb_impute_cols, all_vars(. != Inf))

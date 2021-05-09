@@ -1,6 +1,8 @@
 library(dplyr)
 library(stringr)
 library(magrittr)
+library(randomForestSRC)
+library(survival)
 library(ggplot2)
 
 # Load data
@@ -63,7 +65,7 @@ weighted_avgs <- adjusted %>%
   dplyr::summarize_at(
     # We need SOS-weighted stats for most things, but also need a few others
     # that we excluded from SOS weighting
-    vars("mp_per_g", "mp", "usg_pct", "ft_pct", "fta_per_fga_pct", "fg3a_per_fga_pct",
+    vars("sos", "mp_per_g", "mp", "usg_pct", "ft_pct", "fta_per_fga_pct", "fg3a_per_fga_pct",
          c(tidyselect::matches("sos_weighted"))),
     # We need to sum these stats for "career" stats, average them for straight
     # averages (specifically MPG, USG%), and our weighted averages for everything else
@@ -110,13 +112,14 @@ pid_map <- c(
   "jeff-ayres" = "jeff-pendergraph",
   "henry-walker" = "bill-walker",
   "lou-amundson" = "louis-amundson",
-  "jeff-sheppard" = "jeffrey-sheppard"
+  "jeff-sheppard" = "jeffrey-sheppard",
+  "michael-porter" = "michael-porterjr"
 )
 
 rookies_joined <- weighted_avgs %>%
   # Only keep columns we want to model with
-  dplyr::select(pid, height, weight, yo_college, pos, rsci, mp_sum, mp_mean,
-                mp_per_g_mean, tidyselect::matches("_weighted_weighted")) %>%
+  dplyr::select(pid, height, weight, yo_college, pos, rsci, sos_mean, mp_sum, mp_mean,
+                mp_per_g_mean, tidyselect::ends_with("_weighted")) %>%
   dplyr::mutate(
     # Translate NCAA PID form to NBA PID form
     nba_pid = ifelse(
@@ -141,11 +144,13 @@ rookies_joined <- weighted_avgs %>%
           "{str_replace_all(tolower(sapply(strsplit(player, ','), '[', 2)), ' ', '-') %>%
             str_replace_all(., \"'\", '') %>%
             str_replace_all(., '\\\\.', '') %>%
-            str_replace_all(., 'á', 'a')}\\
+            str_replace_all(., 'á', 'a') %>%
+            str_replace_all(., 'è', 'e')}\\
           -{str_replace_all(tolower(sapply(strsplit(player, ','), '[', 1)), ' ', '-') %>%
             str_replace_all(., \"'\", '') %>%
             str_replace_all(., '\\\\.', '') %>%
-            str_replace_all(., 'á', 'a')}")))
+            str_replace_all(., 'á', 'a') %>%
+            str_replace_all(., 'è', 'e')}")))
       ) %>%
       dplyr::mutate_at("pid", ~ ifelse(.x %in% names(pid_map),
                                        pid_map[.x],
@@ -239,10 +244,217 @@ dv <- "ts_pct"
 
 # Stage 1: Inclusion Model
 inc_mod_df <- rookies_joined %>%
-  dplyr::mutate(inclusion_dv = ifelse(!is.na(dv), 1L, 0L),
+  dplyr::mutate(inclusion_dv = as.factor(ifelse(!is.na(!!sym(dv)), 1, 0)),
                 pos_ncaa = as.factor(pos_ncaa)) %>%
-  dplyr::select(c(dplyr::intersect(colnames(weighted_avgs),
+  dplyr::select(c(dplyr::intersect(
+                    dplyr::setdiff(colnames(weighted_avgs), c("pid")),
                                    colnames(rookies_joined)),
                   "pos_ncaa", "height_imputed", "weight_imputed",
                   "inclusion_dv"))
-inc_mod <- randomForestSRC::rfsrc(inclusion_dv ~., inc_mod_df)
+
+# Base Logistic Regression
+base_inc_model <- glmnet::cv.glmnet(
+  x = inc_mod_df %>%
+    dplyr::mutate(rsci = factor(rsci, ordered = FALSE)) %>%
+    model.matrix(inclusion_dv ~ pos_ncaa + yo_college + height + weight +
+                    rsci + height:pos_ncaa + weight:pos_ncaa +
+                    height_imputed + weight_imputed, .),
+  y = as.numeric(as.character(inc_mod_df$inclusion_dv)) %>% as.matrix())
+
+# args
+NFOLDS <- 10
+upsampled_samp_prop <- .3 # underrepresented class will comprise {upsampled_samp_prop} * 100% of the sample
+n_upsampled_records <- floor(sum(as.numeric(as.character(inc_mod_df$inclusion_dv))) * .8) # {n_upsampled_records} will be in the sample
+
+# params based on args
+# Want to maintain even sampling distribution of records, so institute max sample counts
+n_downsampled_records <- floor((n_upsampled_records / upsampled_samp_prop) - n_upsampled_records)
+max_sample_count_1 <- ceiling(
+  NFOLDS * n_upsampled_records /
+    nrow(inc_mod_df[inc_mod_df$inclusion_dv == 1,])
+)
+max_sample_count_0 <- ceiling(
+  NFOLDS * n_downsampled_records /
+  nrow(inc_mod_df[inc_mod_df$inclusion_dv == 0,])
+)
+inc_mod_df <- rookies_joined %>%
+  dplyr::left_join(valid_mp_seasons_by_pid) %>%
+  dplyr::filter(!(trd_season %in% c("2020", "2021")), weight > 0) %>%
+  dplyr::mutate(inclusion_dv = ifelse(!is.na(!!sym(dv)), 1, 0),
+                pos_ncaa = as.factor(pos_ncaa),
+                rsci = factor(rsci, ordered = FALSE),
+                index = dplyr::row_number(),
+                sample_count = 0) %>%
+  # remove columns that cause deficient rank
+  dplyr::select(-c("fg2_per_100_sos_weighted_weighted",
+                   "fg2a_per_100_sos_weighted_weighted"))
+
+conf_matrices <- list()
+for (x in 1:NFOLDS) {
+  message(str_glue("Formulating GLM for fold {x}"))
+
+  train_data_1 <- tryCatch(
+    dplyr::sample_n(inc_mod_df[inc_mod_df$inclusion_dv == 1 &
+                                 inc_mod_df$sample_count < max_sample_count_1, ],
+                    size = n_upsampled_records),
+    error = function(e) {
+      inc_mod_df %>%
+        dplyr::filter(inclusion_dv == 1, sample_count < max_sample_count_1)
+    })
+
+  train_data_0 <- tryCatch(
+    dplyr::sample_n(inc_mod_df[inc_mod_df$inclusion_dv == 0 &
+                                 inc_mod_df$sample_count < max_sample_count_0, ],
+                    size = n_downsampled_records),
+    error = function(e) {
+      inc_mod_df %>%
+        dplyr::filter(inclusion_dv == 0,sample_count < max_sample_count_0)
+    })
+
+  train_data <- dplyr::bind_rows(train_data_0, train_data_1)
+
+  form <- inc_mod_df %>%
+    dplyr::select(pos_ncaa, yo_college, height, weight, rsci, height_imputed,
+                  weight_imputed, mp_sum, mp_mean,
+                  tidyselect::ends_with("_weighted")) %>%
+    colnames() %>%
+    paste(collapse = " + ") %>%
+    paste0("inclusion_dv ~ ", ., " + height:pos_ncaa + weight:pos_ncaa")
+
+  mod <- glm(as.formula(form),
+    train_data,
+    family = binomial(link = "logit"))
+
+
+  test_data <- inc_mod_df %>%
+    dplyr::filter(!(index %in% train_data$index))
+
+  conf_matrix <- dplyr::bind_cols(
+    test_data, "pred" = predict.glm(mod, test_data, type = "response")) %>%
+    dplyr::group_by(inclusion_dv) %>%
+    dplyr::summarize(pred_0 = sum(ifelse(pred < .5, 1, 0)),
+                     pred_1 = sum(ifelse(pred >= .5, 1, 0))) %>%
+    dplyr::ungroup()
+
+  conf_matrices[[x]] <- conf_matrix
+
+  inc_mod_df <- inc_mod_df %>%
+    dplyr::mutate_at("sample_count", ~ ifelse(index %in% train_data$index, .x + 1, .x))
+}
+
+purrr::map_dfr(conf_matrices, dplyr::bind_rows) %>%
+  dplyr::mutate_at(c("pred_0", "pred_1"),
+                   list("pct" = ~ .x / (pred_0 + pred_1))) %>%
+  dplyr::group_by(inclusion_dv) %>%
+  dplyr::summarize_all(mean)
+
+rookies_joined %>%
+  dplyr::mutate_at(c("pos_ncaa", "rsci"), factor, ordered = F) %>%
+  predict(base_inc_model)
+
+make_sampling_weights <- function(df, upweight_val, ntree) {
+  df %>%
+    dplyr::mutate(
+      inc_weight = ifelse(inclusion_dv == 1,
+                          upweight_val,
+                          1)
+    ) %>%
+    dplyr::pull(inc_weight) %>%
+    rep(ntree) %>%
+    matrix(nrow = nrow(df), ncol = ntree)
+}
+
+btstrap_weights_500 <- make_sampling_weights(inc_mod_df, 20.59515, 500)
+btstrap_weights_1k <- make_sampling_weights(inc_mod_df, 20.59515, 1000)
+
+inc_mod <- randomForestSRC::rfsrc(inclusion_dv ~ .,
+                                  as.data.frame(inc_mod_df),
+                                  mtry = floor(.2 * (ncol(inc_mod_df) - 1)),
+                                  splitrule = "random",
+                                  samp = btstrap_weights_500,
+                                  ntree = 500)
+inc_mod_1k <- randomForestSRC::rfsrc(inclusion_dv ~ .,
+                                  as.data.frame(inc_mod_df),
+                                  mtry = floor(.2 * (ncol(inc_mod_df) - 1)),
+                                  splitrule = "random",
+                                  samp = btstrap_weights_1k,
+                                  ntree = 1000)
+inc_mod_default_btstrap <- randomForestSRC::rfsrc(inclusion_dv ~ .,
+                                  as.data.frame(inc_mod_df),
+                                  mtry = floor(.2 * (ncol(inc_mod_df) - 1)),
+                                  splitrule = "random",
+                                  ntree = 500)
+
+
+rookies_joined %>%
+  dplyr::left_join(valid_mp_seasons_by_pid) %>%
+  dplyr::bind_cols("inclusion_prob" = inc_mod$predicted.oob[,2]) %>%
+  #dplyr::filter(trd_season == 2021) %>%
+  dplyr::select(pid, inclusion_prob, yo_college, nba_pid, pts_per_poss) %>%
+  dplyr::arrange(desc(inclusion_prob)) %>%
+  dplyr::mutate(rank = dplyr::row_number()) %>%
+  View()
+
+# Survival Models
+new_bio_impute_cols <- c(bio_impute_cols[bio_impute_cols != "pos_ncaa"], "pos")
+weighted_avgs %>%
+  # First time period is college
+  dplyr::select(pid, height, weight, yo_college, pos, rsci, mp_sum, mp_mean,
+                mp_per_g_mean, tidyselect::matches("_weighted_weighted")) %>%
+  impute_bio_info("weight",
+                  new_bio_impute_cols,
+                  c("pos")) %>%
+  impute_bio_info( "height",
+                  new_bio_impute_cols,
+                  c("pos")) %>%
+  dplyr::filter(!is.na(pos)) %>%
+  dplyr::filter(!is.na(mp_per_g_mean)) %>%
+  dplyr::mutate(time = 0, status = 1) %>%
+  dplyr::union_all(
+    rookies_joined %>%
+      dplyr::filter(!is.na(ts_pct)) %>%
+      dplyr::select(pid, height, weight, yo_college, pos_ncaa, rsci, mp_sum, mp_mean,
+                    mp_per_g_mean, tidyselect::matches("_weighted_weighted"),
+                    weight, weight_imputed, height, height_imputed) %>%
+      dplyr::rename(pos = pos_ncaa) %>%
+      dplyr::mutate(time = 1, status = 1)
+  )
+
+surv_df <- rookies_joined %>%
+  dplyr::mutate(pos_ncaa = as.factor(pos_ncaa),
+                year = 1,
+                in_nba = ifelse(is.na(ts_pct), 1, 0)) %>%
+  dplyr::select(height, weight, yo_college, pos_ncaa, rsci, mp_sum, mp_mean,
+                mp_per_g_mean, tidyselect::matches("_weighted_weighted"),
+                weight, weight_imputed, height, height_imputed,
+                year, in_nba) %>%
+  data.frame()
+
+surv_mod <-  rfsrc(Surv(year, in_nba) ~ ., surv_df, splitrule = "random")
+
+rookies_joined %>%
+  dplyr::left_join(valid_mp_seasons_by_pid) %>%
+  dplyr::bind_cols("p_not_in_nba" = surv_mod$predicted.oob) %>%
+  #dplyr::filter(trd_season == 2021) %>%
+  dplyr::select(pid, p_not_in_nba, yo_college, nba_pid, pts_per_poss) %>%
+  dplyr::arrange(p_not_in_nba) %>%
+  dplyr::mutate(rank = dplyr::row_number()) %>%
+  View()
+
+nba_fst_seasons <- nba_player %>%
+  dplyr::left_join(fst_seasons) %>%
+  dplyr::filter(year == fst_year)
+
+k <- 20
+n_obs <- nrow(nba_fst_seasons)
+.init_centers <- runif(k)
+centers <- rep(.init_centers, n_obs) %>%
+  sort() %>%
+  matrix(nrow = n_obs, ncol = k) %>%
+  as_data_frame() %>%
+  setNames(paste0("center_", seq(1, k)))
+.cluster_df <- nba_fst_seasons %>%
+  dplyr::select(pts_per_poss, fga) %>%
+  dplyr::bind_cols(centers)
+.cluster_df %>%
+  dplyr::m
