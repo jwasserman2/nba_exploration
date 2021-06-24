@@ -1,6 +1,7 @@
 library(dplyr)
 library(stringr)
 library(magrittr)
+library(rlang)
 library(randomForestSRC)
 library(survival)
 library(ggplot2)
@@ -26,64 +27,75 @@ red <- "#B22222"
 
 # Determine weights for college weighted averages
 valid_mp_seasons_by_pid <- adjusted %>%
-  dplyr::select(pid, class, season, mp) %>%
   dplyr::group_by(pid) %>%
-  dplyr::summarize(yo_college = max(season) - min(season) + 1,
-                   num_valid_seasons = sum(ifelse(mp > 20, 1, 0)),
-                   trd_season = max(season[mp > 20]),
-                   sec_season = ifelse(num_valid_seasons >= 2,
-                                       max(season[mp > 20 & season != trd_season]),
-                                       NA_integer_),
-                   fst_season = ifelse(num_valid_seasons >= 3,
-                                       max(season[mp > 20 & season != trd_season &
-                                                    season != sec_season]),
-                                       NA_integer_),
-                   trd_season_wt = ifelse(!is.na(trd_season) & trd_season != -Inf,
-                                          sqrt(mp[season == trd_season]) * .6,
-                                          0),
-                   sec_season_wt = ifelse(!is.na(sec_season) & sec_season != -Inf,
-                                          sqrt(mp[season == sec_season]) * .3,
-                                          0),
-                   fst_season_wt = ifelse(!is.na(fst_season) & fst_season != -Inf,
-                                          sqrt(mp[season == fst_season]) * .1,
-                                          0),
-                   total_weights = trd_season_wt + sec_season_wt + fst_season_wt) %>%
-  dplyr::ungroup()
+  dplyr::summarize(
+    yo_college = max(season) - min(season) + 1,
+    num_valid_seasons = sum(ifelse(mp > 20, 1, 0)),
+    last_season = max(season[mp > 20]),
+    last_minus_1_season = ifelse(
+      num_valid_seasons >= 2,
+      max(season[mp > 20 & season != last_season]),
+      NA_integer_),
+    last_minus_2_season = ifelse(
+      num_valid_seasons >= 3,
+      max(season[mp > 20 & season != last_season & season != last_minus_1_season]),
+      NA_integer_)) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(num_valid_seasons > 0)
+
+adjusted_with_weights <- adjusted %>%
+  dplyr::left_join(valid_mp_seasons_by_pid, by = "pid") %>%
+  dplyr::filter(!is.na(num_valid_seasons)) %>%
+  dplyr::mutate(
+    season_weight = dplyr::case_when(
+      season == last_season ~ sqrt(mp) * .6,
+      season == last_minus_1_season ~ sqrt(mp) * .3,
+      season == last_minus_2_season ~ sqrt(mp) * .1
+    ))
 
 # Generate 3-year weighted averages of college stats
-weighted_avgs <- adjusted %>%
-  # Join the weighting df
-  dplyr::inner_join(valid_mp_seasons_by_pid) %>%
-  # Numericize position
-  dplyr::mutate_at("pos",
-                   ~ dplyr::case_when(
-                      .x %in% c("0", "GF", "CF", "D") ~ NA_integer_,
-                      .x == "G" ~ 1L,
-                      .x == "F" ~ 2L,
-                      .x == "C" ~ 3L)) %>%
-  dplyr::group_by(pid, pos, yo_college, height, weight, rsci) %>%
+drop_cols <- c("class", "index", "pace", "school", "season", "num_valid_seasons",
+               "last_season", "last_minus_1_season", "last_minus_2_season")
+groupby_cols <- c("pid", "pos", "yo_college", "height", "weight", "rsci")
+
+sum_cols <- c("ast", "blk", "drb", "dws", "fg", "fg2", "fg2a", "fg3", "fg3a",
+              "fga", "ft", "fta", "g", "gs", "mp", "orb", "ows", "pf", "pprod",
+              "pts", "stl", "tov", "trb", "ws")
+career_sums <- adjusted_with_weights %>%
+  dplyr::group_by(!!!syms(groupby_cols)) %>%
   dplyr::summarize_at(
-    # We need SOS-weighted stats for most things, but also need a few others
-    # that we excluded from SOS weighting
-    vars("sos", "mp_per_g", "mp", "usg_pct", "ft_pct", "fta_per_fga_pct", "fg3a_per_fga_pct",
-         c(tidyselect::matches("sos_weighted"))),
-    # We need to sum these stats for "career" stats, average them for straight
-    # averages (specifically MPG, USG%), and our weighted averages for everything else
-    list(sum = ~ sum(.x, na.rm = T),
-         mean = ~ mean(.x, na.rm = T),
-         weighted = ~ sum(dplyr::case_when(
-           season == trd_season ~ .x * trd_season_wt / total_weights,
-           season == sec_season ~ .x * sec_season_wt / total_weights,
-           season == fst_season ~ .x * fst_season_wt / total_weights,
-           TRUE ~ 0)))
+    sum_cols,
+    list(sum = ~ sum(.x, na.rm = T))
   ) %>%
   dplyr::ungroup()
 
-# Find rookie seasons for each NBA player
-fst_seasons <- nba_player %>%
-  dplyr::group_by(player) %>%
-  dplyr::summarize(fst_year = min(year)) %>%
+tidyselect::poke_vars(colnames(adjusted_with_weights))
+mean_cols <- c(sum_cols, "sos",
+               colnames(adjusted_with_weights)[c(
+                 tidyselect::contains("pct"), tidyselect::ends_with("per_g"),
+                 tidyselect::ends_with("per_100"), tidyselect::ends_with("per_40"))])
+career_means <- adjusted_with_weights %>%
+  dplyr::group_by(!!!syms(groupby_cols)) %>%
+  dplyr::summarize_at(
+    mean_cols,
+    list(mean = ~ mean(.x, na.rm = T))
+  ) %>%
   dplyr::ungroup()
+
+career_weighted_avgs <- adjusted_with_weights %>%
+  dplyr::group_by(!!!syms(groupby_cols)) %>%
+  dplyr::summarize_at(
+    vars(mean_cols),
+    list(weighted = ~ sum(season_weight * .x, na.rm = T) /
+           sum(season_weight, na.rm = T))
+  ) %>%
+  dplyr::ungroup()
+
+ncaa_modeling_df <- career_sums %>%
+  dplyr::inner_join(career_means, by = groupby_cols) %>%
+  dplyr::inner_join(career_weighted_avgs, by = groupby_cols)
+
+tidyselect::poke_vars(NULL)
 
 # Full join NBA rookie stats to college weighted averages on PID
 # NCAA PID form: firstname-lastname-#, NBA PID form: firstname-lastname
@@ -113,13 +125,12 @@ pid_map <- c(
   "henry-walker" = "bill-walker",
   "lou-amundson" = "louis-amundson",
   "jeff-sheppard" = "jeffrey-sheppard",
-  "michael-porter" = "michael-porterjr"
+  "michael-porter" = "michael-porterjr",
+  "jj-barea" = "jose-barea"
 )
 
-rookies_joined <- weighted_avgs %>%
-  # Only keep columns we want to model with
-  dplyr::select(pid, height, weight, yo_college, pos, rsci, sos_mean, mp_sum, mp_mean,
-                mp_per_g_mean, tidyselect::ends_with("_weighted")) %>%
+# Create DF for inclusion model
+inclusion_df <- ncaa_modeling_df %>%
   dplyr::mutate(
     # Translate NCAA PID form to NBA PID form
     nba_pid = ifelse(
@@ -129,10 +140,8 @@ rookies_joined <- weighted_avgs %>%
       pid,
       str_replace(pid, "(-\\d+|--\\d+)", ""))
   ) %>%
-  dplyr::full_join(
+  dplyr::left_join(
     nba_player %>%
-      dplyr::left_join(fst_seasons) %>%
-      dplyr::filter(year == fst_year) %>%
       dplyr::mutate(
         # Create NBA PID from first and last names
         pid = dplyr::case_when(
@@ -145,104 +154,52 @@ rookies_joined <- weighted_avgs %>%
             str_replace_all(., \"'\", '') %>%
             str_replace_all(., '\\\\.', '') %>%
             str_replace_all(., 'á', 'a') %>%
+            str_replace_all(., 'ć', 'c') %>%
             str_replace_all(., 'è', 'e')}\\
           -{str_replace_all(tolower(sapply(strsplit(player, ','), '[', 1)), ' ', '-') %>%
             str_replace_all(., \"'\", '') %>%
             str_replace_all(., '\\\\.', '') %>%
             str_replace_all(., 'á', 'a') %>%
+            str_replace_all(., 'ć', 'c') %>%
             str_replace_all(., 'è', 'e')}")))
       ) %>%
       dplyr::mutate_at("pid", ~ ifelse(.x %in% names(pid_map),
                                        pid_map[.x],
-                                       .x)),
-    by = c("nba_pid" = "pid"),
-    suffix = c("_ncaa", "_nba")
-  )
+                                       .x)) %>%
+      dplyr::distinct(pid) %>%
+      dplyr::mutate(inclusion_dv = 1),
+    by = c("nba_pid" = "pid")
+  ) %>%
+  dplyr::mutate_at("inclusion_dv", ~ ifelse(is.na(.x), 0, .x))
 
-# Handling NA's for weight and height
-# Use these cols for imputation models
-bio_impute_cols <- c(
-  "height", "pos_ncaa", "weight",
-  "blk_per_100_sos_weighted_weighted",
-  "drb_per_100_sos_weighted_weighted",
-  "fg2a_per_100_sos_weighted_weighted",
-  "fg3a_per_100_sos_weighted_weighted",
-  "fta_per_100_sos_weighted_weighted",
-  "orb_per_100_sos_weighted_weighted",
-  "trb_per_100_sos_weighted_weighted",
-  "blk_pct_sos_weighted_weighted",
-  "orb_pct_sos_weighted_weighted",
-  "trb_pct_sos_weighted_weighted"
-)
-
-# Function for imputing bio info
-impute_bio_info <- function(player_df, impute_dv, impute_covs, impute_covs_to_dummify) {
-  message(str_glue("Imputing {impute_dv}..."))
-  # GLM model used for imputing
-  mod <- glmnet::cv.glmnet(
-    x = player_df %>%
-      dplyr::select(!!!syms(impute_covs)) %>%
-      dplyr::filter_all(all_vars(!is.na(.))) %>%
-      dplyr::mutate_at(impute_covs_to_dummify, as.factor) %>%
-      dplyr::select(-!!sym(impute_dv)) %>%
-      model.matrix(~ ., .),
-    y = player_df %>%
-      dplyr::select(c(impute_covs, impute_dv)) %>%
-      dplyr::filter_all(all_vars(!is.na(.))) %>%
-      dplyr::pull(!!sym(impute_dv)) %>%
-      as.matrix())
-
-  # Join imputed values and add to full df
-  preds <- predict(
-    mod,
-    player_df %>%
-      dplyr::filter(is.na(!!sym(impute_dv))) %>%
-      dplyr::select(!!!syms(dplyr::setdiff(impute_covs, impute_dv))) %>%
-      dplyr::filter_all(all_vars(!is.na(.))) %>%
-      dplyr::mutate_at(impute_covs_to_dummify, as.factor) %>%
-      model.matrix(~ ., .))
-
-  # Return df that has impute values and original values and columns indicating
-  # the imputed values
-  out_df <- player_df %>%
-    dplyr::filter(is.na(!!sym(impute_dv))) %>%
-    dplyr::select(-!!sym(impute_dv)) %>%
-    dplyr::filter_at(dplyr::setdiff(impute_covs, impute_dv),
-                     ~ !is.na(.x)) %>%
-    dplyr::bind_cols(!!impute_dv := as.vector(preds)) %>%
-    dplyr::mutate(!!str_glue("{impute_dv}_imputed") := 1) %>%
-    dplyr::bind_rows(
-      player_df %>%
-        dplyr::filter(!is.na(!!sym(impute_dv))) %>%
-        dplyr::mutate(!!str_glue("{impute_dv}_imputed") := 0)
-    )
-
-  return(out_df)
-}
-
-rookies_joined <- impute_bio_info(rookies_joined,
-                                  "weight",
-                                  bio_impute_cols,
-                                  c("pos_ncaa")) %>%
-  impute_bio_info(.,
-                  "height",
-                  bio_impute_cols,
-                  c("pos_ncaa"))
-
-# Everyone who's missing a position is missing games and MP--we'll just remove
-# rather than do the bidirectional imputation that would probably use weight and
-# height
-rookies_joined %<>%
-  dplyr::filter(!is.na(pos_ncaa))
-
-# Filter out 15 records with missing minutes
-rookies_joined %<>%
-  dplyr::filter(!is.na(mp_per_g_mean))
-
-## LET'S MODEL
-dv <- "ts_pct"
+# Filter records without position
+inclusion_df %<>%
+  dplyr::filter(!is.na(pos))
 
 # Stage 1: Inclusion Model
+tidyselect::poke_vars(colnames(inclusion_df)[!str_detect(colnames(inclusion_df), "sos")])
+standardize_df_vars <- function(df) {
+  sds <- sapply(df, sd)
+  sds_matrix <- matrix(sds) %>%
+    rep(., nrow(df)) %>%
+    matrix(ncol = nrow(df))
+
+  means <- colMeans(df)
+  means_matrix <- matrix(means) %>%
+    rep(., nrow(df)) %>%
+    matrix(ncol = nrow(df))
+
+  return((df - means_matrix) / sds_matrix)
+}
+g_pca <- inclusion_df %>%
+  dplyr::filter(pos == "G") %>%
+  dplyr::select(tidyselect::ends_with("sum"), tidyselect::ends_with("mean"),
+                tidyselect::ends_with("weighted")) %>%
+  standardize_df_vars() %>%
+  princomp()
+matrix(c(rep(1, 8), rep(0, 8)), ncol = 4) - matrix(rep(c(1, 1, 0, 0), 4), nrow = 4)
+g_pca$scores[, 0:4]
+
 inc_mod_df <- rookies_joined %>%
   dplyr::mutate(inclusion_dv = as.factor(ifelse(!is.na(!!sym(dv)), 1, 0)),
                 pos_ncaa = as.factor(pos_ncaa)) %>%
@@ -258,7 +215,7 @@ base_inc_model <- glmnet::cv.glmnet(
     dplyr::mutate(rsci = factor(rsci, ordered = FALSE)) %>%
     model.matrix(inclusion_dv ~ pos_ncaa + yo_college + height + weight +
                     rsci + height:pos_ncaa + weight:pos_ncaa +
-                    height_imputed + weight_imputed, .),
+                    height_imputed + weight_imputed - 1, .),
   y = as.numeric(as.character(inc_mod_df$inclusion_dv)) %>% as.matrix())
 
 # args
@@ -445,16 +402,65 @@ nba_fst_seasons <- nba_player %>%
   dplyr::left_join(fst_seasons) %>%
   dplyr::filter(year == fst_year)
 
-k <- 20
-n_obs <- nrow(nba_fst_seasons)
-.init_centers <- runif(k)
-centers <- rep(.init_centers, n_obs) %>%
-  sort() %>%
-  matrix(nrow = n_obs, ncol = k) %>%
-  as_data_frame() %>%
-  setNames(paste0("center_", seq(1, k)))
-.cluster_df <- nba_fst_seasons %>%
-  dplyr::select(pts_per_poss, fga) %>%
-  dplyr::bind_cols(centers)
-.cluster_df %>%
-  dplyr::m
+stat <- "ast_per_poss"
+group_cols <- c("pos")
+wide <- nba_player %>%
+  dplyr::select(year, player, !!!syms(c(stat, group_cols))) %>%
+  dplyr::arrange(player, year)
+
+if ("pos" %in% group_cols) {
+  wide <- wide %>% dplyr::left_join(
+    data.frame(
+      "player" = wide %>%
+        dplyr::pull(player) %>%
+        unique(),
+      "all_pos" = wide %>%
+        dplyr::mutate_at("pos", ~ str_replace_all(.x, "-", ",")) %>%
+        dplyr::group_by(player) %>%
+        dplyr::summarize(all_pos = strsplit(paste(pos, collapse = ","), ",")) %>%
+        dplyr::pull(all_pos) %>%
+        lapply(function(x) {paste(sort(unique(x)), collapse = ",")}) %>%
+        rlang::flatten_chr()
+    ),
+    by = "player")
+  group_cols <- c(group_cols[group_cols != "pos"], "all_pos")
+}
+
+wide <- wide %>%
+  dplyr::group_by(player) %>%
+  dplyr::mutate(year_num = row_number()) %>%
+  dplyr::ungroup() %>%
+  tidyr::pivot_wider(id_cols = c("player", group_cols),
+                     names_from = "year_num",
+                     names_prefix = "year_",
+                     values_from = stat)
+
+year_cols <- tidyselect::vars_select(colnames(wide),
+                                     tidyselect::contains("year"))
+diffs <- wide %>%
+  dplyr::select(player, !!!syms(group_cols))
+for (col in year_cols) {
+  col_num <- as.numeric(str_extract(col, "(?<=year_)[0-9]+"))
+  prev_year_col <- paste0("year_", col_num - 1)
+  if ((col_num == 1) |
+    (col_num == max(as.numeric(str_extract(year_cols, "(?<=year_)[0-9]+"))))) {
+    diffs[, col] <- wide[, col]
+  } else {
+    diffs[, col] <- wide[,col] - wide[,prev_year_col]
+  }
+}
+
+diffs %>%
+  dplyr::group_by(!!!syms(group_cols)) %>%
+  dplyr::summarize_at(year_cols, mean, na.rm = TRUE) %>%
+  dplyr::summarize_at(year_cols, list("mean" = ~ mean(.x, na.rm = TRUE),
+                                      "count" = ~ sum(ifelse(!is.na(.x), 1, 0)))) %>%
+  dplyr::ungroup() %>%
+  tidyr::pivot_longer(cols = -group_cols, names_to = "stat", values_to = "value") %>%
+  dplyr::mutate(year = str_extract(stat, "[\\d]+"))
+  dplyr::mutate_at("stat", ~ as.numeric(str_replace(.x, "year_", ""))) %>%
+  dplyr::rename(year="stat", diff="value") %>%
+  ggplot(aes(x = year, y = diff, group = all_pos)) +
+  geom_line(aes(color = all_pos))
+
+

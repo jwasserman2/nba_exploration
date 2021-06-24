@@ -86,7 +86,7 @@ logging.info('Finished pulling seasons')
 # Make individual-level NCAA stats df
 all_ncaa = pd.DataFrame()
 all_school_stats = pd.DataFrame()
-for num, suffix in enumerate(season_links[10768:len(season_links)]):
+for num, suffix in enumerate(season_links):
     year = suffix.split('/')[len(suffix.split('/')) - 1].replace(
         '.html', '')
     if int(year) < 1995:
@@ -109,7 +109,7 @@ for num, suffix in enumerate(season_links[10768:len(season_links)]):
 
     # Calculate pace
     team_soup = season_soup.find_all(
-        'div', attrs={'id': 'all_schools-totals'})[0].find_all('tr')
+        'div', attrs={'id': 'all_schools'})[0].find_all('tr')
     regex = '(?<=data-stat=")[A-Za-z0-9_]+(?=")'
     team_stats = [y for z in [x.find_all('td') for x in team_soup
                   if 'Opponent' in str(x) or 'Team' in str(x)] for y in z]
