@@ -16,6 +16,15 @@ discard_cols <- c(
 nba_player %<>%
   dplyr::select(-discard_cols)
 
+nba_combine <- readr::read_csv("~/Documents/combine.csv")
+colnames(nba_combine) <- trimws(colnames(nba_combine), whitespace = "[\\s]", which = "both") %>%
+  str_replace_all(., "/", "") %>%
+  str_replace_all(., "%", "") %>%
+  str_replace_all(., "\\([A-Z]+\\)", "") %>%
+  trimws(., whitespace = "[\\s]", which = "both") %>%
+  str_replace_all(., "\\s", "_") %>%
+  tolower(.)
+
 # Custom colors for viz
 darkblue <- "#191970"
 lightblue <- "#1E90FF"
@@ -97,7 +106,66 @@ ncaa_modeling_df <- career_sums %>%
 
 tidyselect::poke_vars(NULL)
 
-# Full join NBA rookie stats to college weighted averages on PID
+# Munge NBA Combine stats and join
+munged_combine <- nba_combine %>%
+  dplyr::mutate_if(is.character, ~ str_replace(.x, "%", "")) %>%
+  dplyr::mutate_if(is.character, ~ dplyr::case_when(trimws(.x) == "-" ~ "DNP",
+                                                    is.na(.x) ~ "DNP",
+                                                    TRUE ~ .x)) %>%
+  dplyr::mutate_at(setdiff(colnames(nba_combine), c("player", "pos", "year")),
+                   list("dnp" = ~ ifelse(.x == "DNP", 1, 0),
+                        "dne" = ~ ifelse(.x == "DNE", 1, 0))) %>%
+  dplyr::mutate_at(c("height_wo_shoes", "height_w_shoes", "standing_reach",
+                     "wingspan"),
+                   ~ ifelse(.x %in% c("DNP", "DNE"), NA_real_,
+                          (str_replace_all(.x, "\\s", "") %>%
+                            str_split(., "'") %>%
+                            sapply(., "[", 1) %>% as.numeric() * 12) +
+                            (str_replace_all(.x, "\\s", "") %>%
+                               str_split(., "'") %>%
+                               sapply(., "[", 2) %>% as.numeric()))) %>%
+  dplyr::mutate_at(setdiff(colnames(nba_combine), c("player", "pos", "year")),
+                   ~ ifelse(.x %in% c("DNP", "DNE"), 0, as.numeric(.x)))  %>%
+  dplyr::mutate(pid = str_replace_all(player, "\\?", "") %>%
+                  str_replace_all(., "\\.", "") %>%
+                  str_replace_all(., "'", "") %>%
+                  str_replace_all(., " ", "-") %>%
+                  tolower(.) %>%
+                  str_replace_all(., "-jr$", "jr") %>%
+                  str_replace_all(., "-ii$", "ii") %>%
+                  str_replace_all(., "-iii$", "iii") %>%
+                  str_replace_all(., "-iv$", "iv")) %>%
+  dplyr::select(-pos)
+
+deduped_munged_combine <- munged_combine %>%
+  dplyr::inner_join(
+    munged_combine %>%
+      dplyr::group_by(pid) %>%
+      dplyr::summarize(last_combine = max(year)) %>%
+      dplyr::ungroup(),
+    by = c("pid", "year" = "last_combine"))
+
+ncaa_modeling_df <- ncaa_modeling_df %>%
+  dplyr::left_join(valid_mp_seasons_by_pid[, c("pid", "last_season")], by = "pid") %>%
+  dplyr::mutate_at("pid", ~ dplyr::case_when(
+    str_replace(.x, "-[0-9]+", "") == "tim-hardaway-jr" ~ "tim-hardawayjr",
+    TRUE ~ str_replace(str_replace(.x, "--[0-9]+", ""), "-[0-9]+", ""))) %>%
+  dplyr::left_join(
+    deduped_munged_combine,
+    by = c("pid", "last_season" = "year"),
+    suffix = c("_ncaa", "_combine")) %>%
+  dplyr::mutate(
+    weight_coalesce = dplyr::coalesce(weight_combine, weight_ncaa),
+    height_coalesce = dplyr::coalesce(height_wo_shoes, height)) %>%
+  dplyr::mutate_at(vars(tidyselect::ends_with("dne")),
+                   ~ ifelse(is.na(.x), 0, .x)) %>%
+  dplyr::mutate_at(vars(tidyselect::ends_with("dnp")),
+                   ~ ifelse(is.na(.x), 1, .x)) %>%
+  dplyr::mutate_at(setdiff(colnames(nba_combine),
+                           c("weight", "player", "pos", "year")),
+                   ~ ifelse(is.na(.x), 0, .x))
+
+# Join NBA df to college weighted averages on PID
 # NCAA PID form: firstname-lastname-#, NBA PID form: firstname-lastname
 
 # Mapping for specific players for whom this PID join needs manual alteration
@@ -189,34 +257,76 @@ standardize_df_vars <- function(df) {
     rep(., nrow(df)) %>%
     matrix(ncol = nrow(df))
 
-  return((df - means_matrix) / sds_matrix)
+  return((df - t(means_matrix)) / t(sds_matrix))
 }
+
 g_pca <- inclusion_df %>%
   dplyr::filter(pos == "G") %>%
   dplyr::select(tidyselect::ends_with("sum"), tidyselect::ends_with("mean"),
-                tidyselect::ends_with("weighted")) %>%
+                tidyselect::ends_with("weighted"), tidyselect::ends_with("dnp"),
+                tidyselect::ends_with("dne"), tidyselect::ends_with("coalesce"),
+                setdiff(colnames(nba_combine),
+                        c("pos", "weight", "player", "height_w_shoes", "year"))) %>%
   standardize_df_vars() %>%
   princomp()
-matrix(c(rep(1, 8), rep(0, 8)), ncol = 4) - matrix(rep(c(1, 1, 0, 0), 4), nrow = 4)
-g_pca$scores[, 0:4]
 
-inc_mod_df <- rookies_joined %>%
-  dplyr::mutate(inclusion_dv = as.factor(ifelse(!is.na(!!sym(dv)), 1, 0)),
-                pos_ncaa = as.factor(pos_ncaa)) %>%
-  dplyr::select(c(dplyr::intersect(
-                    dplyr::setdiff(colnames(weighted_avgs), c("pid")),
-                                   colnames(rookies_joined)),
-                  "pos_ncaa", "height_imputed", "weight_imputed",
-                  "inclusion_dv"))
+tidyselect::poke_vars(NULL)
+anthro_cols <- c("lane_agility_time", "shuttle_run", "three_quarter_sprint",
+                 "standing_vertical_leap", "max_vertical_leap", "body_fat",
+                 "hand_length", "hand_width")
+train_df <- inclusion_df %>%
+  dplyr::filter(pos == "G", last_season < 2020)
+# form <- paste0(
+#   "inclusion_dv ~ ",
+#   paste(c(colnames(inclusion_df)[str_detect(colnames(inclusion_df), "weighted")],
+#           colnames(inclusion_df)[str_detect(colnames(inclusion_df), "sum")],
+#           colnames(inclusion_df)[str_detect(colnames(inclusion_df), "mean")],
+#           "yo_college", "rsci", "sos_weighted", "height_coalesce", "weight_coalesce"),
+#         collapse = " + "),
+#   " + ",
+#   paste(paste0("s(", anthro_cols, ", k=2, by=", anthro_cols, "_dnp)"), collapse = " + "))
+form <- paste0(
+  "inclusion_dv ~ ",
+  paste(c(paste0("Comp.", 1:23),
+          "yo_college", "rsci", "sos_weighted", "height_coalesce", "weight_coalesce"),
+        collapse = " + "),
+  " + ",
+  paste(paste0("s(", anthro_cols, ", k=2, by=", anthro_cols, "_dnp)"), collapse = " + "))
+mod <- train_df %>%
+  dplyr::select(tidyselect::ends_with("sum"), tidyselect::ends_with("mean"),
+                tidyselect::ends_with("weighted")) %>%
+  dplyr::select(-sos_weighted) %>%
+  standardize_df_vars() %>%
+  princomp() %>%
+  .$scores %>%
+  .[, 1:23] %>%
+  cbind(., train_df %>%
+          dplyr::select(tidyselect::ends_with("dnp"), tidyselect::ends_with("dne"),
+                        tidyselect::ends_with("coalesce"),
+                        setdiff(colnames(nba_combine),
+                                c("pos", "weight", "player", "height_w_shoes", "year")),
+                        c("sos_weighted", "yo_college", "rsci", "inclusion_dv"))) %>%
+  mgcv::gam(as.formula(form), family = binomial(), data = .)
+pred_df <- inclusion_df %>%
+  dplyr::filter(pos == "G", last_season > 2019) %>%
+  dplyr::select(tidyselect::ends_with("sum"), tidyselect::ends_with("mean"),
+                tidyselect::ends_with("weighted")) %>%
+  dplyr::select(-sos_weighted) %>%
+  prcomp(center = TRUE, scale. = TRUE)
+  standardize_df_vars() %>%
+  princomp() %>%
+  .$scores %>%
+  .[, 1:23] %>%
+  cbind(., train_df %>%
+          dplyr::select(tidyselect::ends_with("dnp"), tidyselect::ends_with("dne"),
+                        tidyselect::ends_with("coalesce"),
+                        setdiff(colnames(nba_combine),
+                                c("pos", "weight", "player", "height_w_shoes", "year")),
+                        c("sos_weighted", "yo_college", "rsci", "inclusion_dv")))
+guard_inc_preds <- data.frame(
+  "pid" = pred_df$pid,
+  "pred" = predict(mod, pred_df, type = "response"))
 
-# Base Logistic Regression
-base_inc_model <- glmnet::cv.glmnet(
-  x = inc_mod_df %>%
-    dplyr::mutate(rsci = factor(rsci, ordered = FALSE)) %>%
-    model.matrix(inclusion_dv ~ pos_ncaa + yo_college + height + weight +
-                    rsci + height:pos_ncaa + weight:pos_ncaa +
-                    height_imputed + weight_imputed - 1, .),
-  y = as.numeric(as.character(inc_mod_df$inclusion_dv)) %>% as.matrix())
 
 # args
 NFOLDS <- 10
