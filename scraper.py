@@ -89,4 +89,4 @@ for year in range(1980, 2021):
     full = totals.merge(per_poss).merge(advanced)
     all_players = pd.concat([all_players, full])
 
-all_players.to_csv('~/Desktop/player_stats.csv', index=False)
+all_players.to_csv('./data/player_stats.csv', index=False)

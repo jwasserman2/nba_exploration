@@ -16,13 +16,13 @@ base_ncaa_url = 'https://www.sports-reference.com'
 # Constant regex expressions
 PLYR_NAME_REGEX = '(?<=csk=")[\\\'A-Za-z0-9\\s\\-,.\\\\_()é]+(?=")'
 STAT_REGEX = '(?<=data-stat=")[A-Za-z0-9_\\-]+(?=")'
-ID_REGEX = '(?<=data-append-csv=")[A-Za-z0-9\\-_]+(?=")'
+ID_REGEX = '(?<=data-append-csv=")[A-Za-z0-9\\-_\\s]+(?=")'
 
 
 # Functions
 def get_soup(url):
     resp = requests.get(url).text
-    return BeautifulSoup(resp, parser='html_parser')
+    return BeautifulSoup(resp, 'html.parser')
 
 
 def regex_fail_return_zero(pattern, text):
@@ -86,7 +86,7 @@ logging.info('Finished pulling seasons')
 # Make individual-level NCAA stats df
 all_ncaa = pd.DataFrame()
 all_school_stats = pd.DataFrame()
-for num, suffix in enumerate(season_links):
+for num, suffix in enumerate(season_links[(4312 + 16690 + 1789):len(season_links)]):
     year = suffix.split('/')[len(suffix.split('/')) - 1].replace(
         '.html', '')
     if int(year) < 1995:
@@ -183,5 +183,5 @@ for num, suffix in enumerate(season_links):
             suffix, num, len(season_links)))
 
 logging.info('Finished pulling player stats')
-all_ncaa.to_csv('~/Desktop/all_ncaa_stats.csv', index=False)
-all_school_stats.to_csv('~/Desktop/all_school_stats.csv', index=False)
+all_ncaa.to_csv('./data/all_ncaa_stats.csv', index=False)
+all_school_stats.to_csv('./data/all_school_stats.csv', index=False)
