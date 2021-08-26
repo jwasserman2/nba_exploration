@@ -5,17 +5,9 @@ library(rlang)
 library(ggplot2)
 
 # Load data
-ncaa_player <- readr::read_csv("~/Desktop/all_ncaa_stats.csv")
-player_2021 <- readr::read_csv("~/Desktop/ncaa_stats_2021.csv")
-ncaa_team <- readr::read_csv("~/Desktop/all_school_stats.csv")
-team_2021 <- readr::read_csv("~/Desktop/school_stats_2021.csv")
-
-ncaa_player <- ncaa_player %>%
-  dplyr::filter(season != 2021) %>%
-  dplyr::bind_rows(player_2021)
-ncaa_team <- ncaa_team %>%
-  dplyr::filter(season != 2021) %>%
-  dplyr::bind_rows(team_2021)
+setwd("~/nba_exploration")
+ncaa_player <- readr::read_csv("data/all_ncaa_stats.csv")
+ncaa_team <- readr::read_csv("data/all_school_stats.csv")
 
 # Custom colors for viz
 darkblue <- "#191970"
