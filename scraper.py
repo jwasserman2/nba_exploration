@@ -11,7 +11,7 @@ def get_soup(url):
 
 
 all_players = pd.DataFrame()
-for year in range(1980, 2021):
+for year in range(1980, 2022):
     print(f'Pulling data from {year}...')
     page_url = f'https://www.basketball-reference.com/leagues/NBA_{year}_totals.html'
     soup = get_soup(page_url)

@@ -1,0 +1,21 @@
+version: 2.1
+
+jobs:
+  check:
+    docker:
+      - image: rocker/r-base:4.2.3
+    steps:
+      - checkout
+      - run: echo "checked out"
+
+  test:
+    docker: rocker/r-base:4.2.3
+    steps:
+      - checkout
+      - run: Rscript -e "sims/category_wins_sims_2022.R"
+
+workflows:
+  test_all:
+    jobs:
+      - check
+      - test
