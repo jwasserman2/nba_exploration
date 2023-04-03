@@ -1,8 +1,12 @@
-library(ggplot2)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(gam)
 library(splines)
 
-players <- readr::read_csv("Documents/nba_exploration/data/player_stats.csv")
-players_2022 <- readr::read_csv("Documents/nba_exploration/data/player_stats_2022.csv")
+players <- readr::read_csv("./data/player_stats.csv")
+players_2022 <- readr::read_csv("./data/player_stats_2022.csv")
 players <- dplyr::bind_rows(players, players_2022) %>%
   dplyr::filter(player != "Caver,Ahmad")
 players$player[players$player == "Claxton,Nic"] <- "Claxton,Nicolas"
@@ -454,75 +458,78 @@ simulate_stats <- function(player_df, pred_df, stat, pred_players, n_sims = 1000
 }
 
 stats <- c("pts", "trb", "fg3", "fg_pct", "ft_pct", "ast", "stl", "blk", "tov")
-long_preds <- purrr::map_dfr(stats, make_stat_preds, players = players)
-wide_preds <- tidyr::pivot_wider(long_preds,
-                                 values_from = "pred",
-                                 names_from = "stat")
-wide_preds <- wide_preds %>%
-  dplyr::left_join(mp_preds %>% dplyr::transmute(player, mp = pred))
 
-pred_players <- players %>%
-  dplyr::filter(year >= 2021) %>%
-  dplyr::pull(player) %>%
-  unique()
-
-all_sims <- Reduce(
-  cbind,
-  lapply(
-    stats,
-    function(stat) {
-      message(paste0("Simming ", stat))
-      sim <- suppressMessages(
-        simulate_stats(players, wide_preds, stat, pred_players, n_sims = 1000)
-      )
-      apply(sim[,-1], 1, mean)
-    }))
-colnames(all_sims) <- stats
-
-# Added prices from last year to a different csv
-prices_csv_path <- "~/Documents/Data/auction_draft_2022_projections_1.csv"
-prices_df <- readr::read_csv(prices_csv_path)
-sim_df <- as.data.frame(all_sims) %>%
-  tibble::rownames_to_column("player") %>%
-  dplyr::left_join(prices_df %>% dplyr::select(player, price_2022)) %>%
-  dplyr::mutate_at("price_2022", ~ ifelse(is.na(.x), 0, .x)) %>%
-  dplyr::mutate_at(colnames(all_sims),
-                   list(stdized = ~ (.x - mean(.x)) / sd(.x),
-                        rank = ~ dplyr::min_rank(.x))) %>%
-  dplyr::mutate_at(vars(tidyselect::ends_with("rank")),
-                   list(top_168 = ~ as.numeric(.x > 698 - 168),
-                        top_100 = ~ as.numeric(.x > 698 - 100),
-                        top_50 = ~ as.numeric(.x > 698 - 50),
-                        top_30 = ~ as.numeric(.x > 698 - 30),
-                        top_10 = ~ as.numeric(.x > 698 - 10))) %>%
-  dplyr::mutate(n_top_168s = pts_rank_top_168 + trb_rank_top_168 +
-                  ast_rank_top_168 + blk_rank_top_168 + stl_rank_top_168 +
-                  ft_pct_rank_top_168 + fg_pct_rank_top_168 + fg3_rank_top_168 +
-                  tov_rank_top_168,
-                n_top_100s = pts_rank_top_100 + trb_rank_top_100 +
-                  ast_rank_top_100 + blk_rank_top_100 + stl_rank_top_100 +
-                  ft_pct_rank_top_100 + fg_pct_rank_top_100 + fg3_rank_top_100 +
-                  tov_rank_top_100,
-                n_top_50s = pts_rank_top_50 + trb_rank_top_50 +
-                  ast_rank_top_50 + blk_rank_top_50 + stl_rank_top_50 +
-                  ft_pct_rank_top_50 + fg_pct_rank_top_50 + fg3_rank_top_50 +
-                  tov_rank_top_50,
-                n_top_30s = pts_rank_top_30 + trb_rank_top_30 +
-                  ast_rank_top_30 + blk_rank_top_30 + stl_rank_top_30 +
-                  ft_pct_rank_top_30 + fg_pct_rank_top_30 + fg3_rank_top_30 +
-                  tov_rank_top_30,
-                n_top_10s = pts_rank_top_10 + trb_rank_top_10 +
-                  ast_rank_top_10 + blk_rank_top_10 + stl_rank_top_10 +
-                  ft_pct_rank_top_10 + fg_pct_rank_top_10 + fg3_rank_top_10 +
-                  tov_rank_top_10
-  )
-csv_path <- "~/Documents/Data/auction_draft_2022_projections_2.csv"
-sim_df %>%
-  readr::write_csv(csv_path)
-
-
-total_shares_with_prices <- readr::read_csv(csv_path)
-max(total_shares_with_prices$price_2022, na.rm = T)
-total_shares_with_prices %>%
-  lm(total_win_shares ~ price_2022, .) %>%
-  summary()
+if (sys.nframe() == 0) {
+  long_preds <- purrr::map_dfr(stats, make_stat_preds, players = players)
+  wide_preds <- tidyr::pivot_wider(long_preds,
+                                   values_from = "pred",
+                                   names_from = "stat")
+  wide_preds <- wide_preds %>%
+    dplyr::left_join(mp_preds %>% dplyr::transmute(player, mp = pred))
+  
+  pred_players <- players %>%
+    dplyr::filter(year >= 2021) %>%
+    dplyr::pull(player) %>%
+    unique()
+  
+  all_sims <- Reduce(
+    cbind,
+    lapply(
+      stats,
+      function(stat) {
+        message(paste0("Simming ", stat))
+        sim <- suppressMessages(
+          simulate_stats(players, wide_preds, stat, pred_players, n_sims = 1000)
+        )
+        apply(sim[,-1], 1, mean)
+      }))
+  colnames(all_sims) <- stats
+  
+  # Added prices from last year to a different csv
+  prices_csv_path <- "~/Documents/Data/auction_draft_2022_projections_1.csv"
+  prices_df <- readr::read_csv(prices_csv_path)
+  sim_df <- as.data.frame(all_sims) %>%
+    tibble::rownames_to_column("player") %>%
+    dplyr::left_join(prices_df %>% dplyr::select(player, price_2022)) %>%
+    dplyr::mutate_at("price_2022", ~ ifelse(is.na(.x), 0, .x)) %>%
+    dplyr::mutate_at(colnames(all_sims),
+                     list(stdized = ~ (.x - mean(.x)) / sd(.x),
+                          rank = ~ dplyr::min_rank(.x))) %>%
+    dplyr::mutate_at(vars(tidyselect::ends_with("rank")),
+                     list(top_168 = ~ as.numeric(.x > 698 - 168),
+                          top_100 = ~ as.numeric(.x > 698 - 100),
+                          top_50 = ~ as.numeric(.x > 698 - 50),
+                          top_30 = ~ as.numeric(.x > 698 - 30),
+                          top_10 = ~ as.numeric(.x > 698 - 10))) %>%
+    dplyr::mutate(n_top_168s = pts_rank_top_168 + trb_rank_top_168 +
+                    ast_rank_top_168 + blk_rank_top_168 + stl_rank_top_168 +
+                    ft_pct_rank_top_168 + fg_pct_rank_top_168 + fg3_rank_top_168 +
+                    tov_rank_top_168,
+                  n_top_100s = pts_rank_top_100 + trb_rank_top_100 +
+                    ast_rank_top_100 + blk_rank_top_100 + stl_rank_top_100 +
+                    ft_pct_rank_top_100 + fg_pct_rank_top_100 + fg3_rank_top_100 +
+                    tov_rank_top_100,
+                  n_top_50s = pts_rank_top_50 + trb_rank_top_50 +
+                    ast_rank_top_50 + blk_rank_top_50 + stl_rank_top_50 +
+                    ft_pct_rank_top_50 + fg_pct_rank_top_50 + fg3_rank_top_50 +
+                    tov_rank_top_50,
+                  n_top_30s = pts_rank_top_30 + trb_rank_top_30 +
+                    ast_rank_top_30 + blk_rank_top_30 + stl_rank_top_30 +
+                    ft_pct_rank_top_30 + fg_pct_rank_top_30 + fg3_rank_top_30 +
+                    tov_rank_top_30,
+                  n_top_10s = pts_rank_top_10 + trb_rank_top_10 +
+                    ast_rank_top_10 + blk_rank_top_10 + stl_rank_top_10 +
+                    ft_pct_rank_top_10 + fg_pct_rank_top_10 + fg3_rank_top_10 +
+                    tov_rank_top_10
+    )
+  csv_path <- "~/Documents/Data/auction_draft_2022_projections_2.csv"
+  sim_df %>%
+    readr::write_csv(csv_path)
+  
+  
+  total_shares_with_prices <- readr::read_csv(csv_path)
+  max(total_shares_with_prices$price_2022, na.rm = T)
+  total_shares_with_prices %>%
+    lm(total_win_shares ~ price_2022, .) %>%
+    summary()
+}

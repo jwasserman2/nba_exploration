@@ -1,21 +1,17 @@
 version: 2.1
 
 jobs:
-  check:
+  sims:
     docker:
-      - image: rocker/r-base:4.2.3
+      - image: nba_exploration
+        auth:
+          username: jwass2
+          password: $DOCKERHUB_PASSWORD
     steps:
       - checkout
-      - run: echo "checked out"
-
-  test:
-    docker: rocker/r-base:4.2.3
-    steps:
-      - checkout
-      - run: Rscript -e "sims/category_wins_sims_2022.R"
+      - run: Rscript tests/test_sim.R
 
 workflows:
   test_all:
     jobs:
-      - check
-      - test
+      - sims
